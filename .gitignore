@@ -48,3 +48,9 @@ Thumbs.db
 
 # Allow mock test data
 !tests/mock_json_test/json/*.json
+
+# exclude project files
+**.sln
+**.vcxproj
+**.vcxproj.user
+**.vcxproj.filters
