@@ -27,6 +27,7 @@ glz::write_float_full<&T::x> // Writes out numbers with full precision (turns of
 
 glz::custom<&T::read, &T::write> // Calls custom read and write std::functions, lambdas, or member functions
 glz::manage<&T::x, &T::read_x, &T::write_x> // Calls read_x() after reading x and calls write_x() before writing x
+glz::as_array<&T::member> // Treat a reflected/member-annotated type as a positional array for read and write
 ```
 
 ## Associated glz::opts
@@ -138,6 +139,8 @@ expect(not glz::read_json(obj, buffer));
 expect(obj.integer == 5);
 ```
 
+When a cast-backed type is used as a key in a map (for example `std::map<MyId, T>`), BEVE now recognises the wrapper and emits the same header as the cast target. This means strong-ID wrappers can be reused across JSON, TOML, and BEVE without specialising custom read/write logic.
+
 ## quoted_num
 
 Read and write numbers as strings.
@@ -203,6 +206,50 @@ expect(obj.layouts.at("first layout") == std::vector<std::string>{"inner1", "inn
 std::string out{};
 glz::write_json(obj, out);
 expect(out == R"({"id":4848,"layouts":"{\"first layout\":[\"inner1\",\"inner2\"]}"})");
+```
+
+## as_array
+
+Convert a positional JSON array into an existing struct while writing back out as an array. Use `glz::as_array<&T::member>` when declaring the member in `glz::object`. Handy when a service sends compact arrays but your C++ type is a struct in memory.
+
+```c++
+struct Person_details
+{
+   std::string_view name;
+   std::string_view surname;
+   std::string_view city;
+   std::string_view street;
+};
+
+struct Person
+{
+   int id{};
+   Person_details person{};
+};
+
+template <>
+struct glz::meta<Person>
+{
+   using T = Person;
+   static constexpr auto value = glz::object(
+      "id", &T::id,
+      "person", glz::as_array<&T::person>
+   );
+};
+
+std::string payload = R"({
+   "id": 1,
+   "person": ["Joe", "Doe", "London", "Chamber St"]
+})";
+
+Person p{};
+expect(!glz::read_json(p, payload));
+expect(p.person.city == "London");
+
+auto written = glz::write_json(p).value();
+expect(written ==
+       R"({"id":1,"person":["Joe","Doe","London","Chamber St"]})"
+);
 ```
 
 ## number
@@ -359,6 +406,18 @@ expect(buffer == R"({"a":"Hello\nWorld","b":"","c":""})");
 
 Enables complex constraints to be defined within a `glz::meta` or using member functions. Parsing is short circuited upon violating a constraint and a nicely formatted error can be produced with a custom error message.
 
+### Field order and optional members
+
+Object members are visited in the order that the JSON input supplies them. This is an intentional design choice so
+that input streams do not have to be re-ordered to match the declaration order. Because of this, a
+`read_constraint` may only rely on fields that have already appeared in the JSON payload. If you need to validate the
+final state of the entire object, use a `self_constraint` as shown below—those run after every field has been read.
+
+Optional members are parsed lazily: if the JSON payload does not contain the key, the member is left untouched and the
+corresponding `read_constraint` is not evaluated. This guarantees that absent optional data does not trigger
+constraints. Keep in mind that reusing the same C++ object across multiple reads will retain the previous value for any
+field that is omitted in later payloads, so reset or re-initialize the instance when you expect fresh state.
+
 ```c++
 struct constrained_object
 {
@@ -378,6 +437,77 @@ struct glz::meta<constrained_object>
                                         "name", read_constraint<&T::name, limit_name, "Name is too long">);
 };
 ```
+
+### Object level validation
+
+To validate combinations of fields after the object has been fully deserialized, provide a single
+`self_constraint` entry. This constraint runs once after all object members have been populated and can therefore
+reason about the final state.
+
+```c++
+struct cross_constrained
+{
+   int age{};
+   std::string name{};
+};
+
+template <>
+struct glz::meta<cross_constrained>
+{
+   using T = cross_constrained;
+
+   static constexpr auto combined = [](const T& v) {
+      return ((v.name.starts_with('A') && v.age > 10) || v.age > 5);
+   };
+
+   static constexpr auto value = object(&T::age, &T::name);
+   static constexpr auto self_constraint = glz::self_constraint<combined, "Age/name combination invalid">;
+};
+```
+
+You can perform more elaborate business logic as well, such as validating that user credentials are consistent and
+secure:
+
+```c++
+struct registration_request
+{
+   std::string username{};
+   std::string password{};
+   std::string confirm_password{};
+   std::optional<std::string> email{};
+};
+
+template <>
+struct glz::meta<registration_request>
+{
+   using T = registration_request;
+
+   static constexpr auto strong_credentials = [](const T& value) {
+      const bool strong_length = value.password.size() >= 12;
+      const bool matches = value.password == value.confirm_password;
+      const bool has_username = !value.username.empty();
+      return strong_length && matches && has_username;
+   };
+
+   static constexpr auto value = object(
+      &T::username,
+      &T::password,
+      &T::confirm_password,
+      &T::email);
+
+   static constexpr auto self_constraint = glz::self_constraint<strong_credentials,
+      "Password must be at least 12 characters and match confirmation">;
+};
+```
+
+If a self constraint fails, deserialization stops and `glz::error_code::constraint_violated` is reported with the
+associated message.
+
+When it is important that object memory remains valid after every individual assignment—for example, when other code
+observes the partially constructed object during parsing—prefer `read_constraint` on the specific members. Those
+constraints fire before the member is written, so the in-memory representation never stores an invalid value. In
+contrast, `self_constraint` runs after fields are populated, so it can detect issues that span multiple members but the
+object may hold the problematic data until the constraint handler reports an error.
 
 ## partial_read
 
@@ -660,4 +790,3 @@ expect(s == R"({"x":[1,2,3]})");
 expect(obj.x[0] == 1);
 expect(obj.x[1] == 2);
 ```
-

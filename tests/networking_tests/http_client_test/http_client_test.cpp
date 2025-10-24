@@ -1,15 +1,43 @@
 #include "glaze/net/http_client.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <future>
+#include <optional>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
+#include "glaze/json/write.hpp"
 #include "glaze/net/http_server.hpp"
+#include "glaze/util/key_transformers.hpp"
 #include "ut/ut.hpp"
 
 using namespace ut;
 using namespace glz;
+
+namespace test_http_client
+{
+   struct put_payload
+   {
+      int value{};
+      std::string message{};
+   };
+}
+
+namespace glz
+{
+   template <>
+   struct meta<test_http_client::put_payload>
+   {
+      using T = test_http_client::put_payload;
+      static constexpr auto value = glz::object("value", &T::value, "message", &T::message);
+   };
+}
 
 // Simplified test server that actually works
 class working_test_server
@@ -18,6 +46,8 @@ class working_test_server
    working_test_server() : port_(0), running_(false) {}
 
    ~working_test_server() { stop(); }
+
+   void set_cors_config(glz::cors_config config) { cors_config_ = std::move(config); }
 
    bool start()
    {
@@ -99,6 +129,7 @@ class working_test_server
    std::thread server_thread_;
    uint16_t port_;
    std::atomic<bool> running_;
+   std::optional<glz::cors_config> cors_config_;
 
    void setup_routes()
    {
@@ -110,6 +141,13 @@ class working_test_server
                          ec.message().c_str());
          }
       });
+
+      if (cors_config_) {
+         server_.enable_cors(*cors_config_);
+      }
+      else {
+         server_.enable_cors();
+      }
 
       server_.get("/hello", [](const request&, response& res) {
          res.status(200).content_type("text/plain").body("Hello, World!");
@@ -129,6 +167,30 @@ class working_test_server
          else {
             res.status(400).body("Invalid JSON");
          }
+      });
+
+      server_.put("/update", [](const request& req, response& res) {
+         std::string response_body = "PUT:";
+         response_body.append(req.body);
+         if (auto it = req.headers.find("x-test-header"); it != req.headers.end()) {
+            response_body.append(":");
+            response_body.append(it->second);
+         }
+         res.status(200).content_type("text/plain").body(response_body);
+      });
+
+      server_.put("/json", [](const request& req, response& res) {
+         auto content_type = req.headers.find("content-type");
+         if (content_type == req.headers.end()) {
+            res.status(415).body("missing content-type");
+            return;
+         }
+
+         std::string response_body = "CT=";
+         response_body.append(content_type->second);
+         response_body.append(";BODY=");
+         response_body.append(req.body);
+         res.status(200).content_type("text/plain").body(response_body);
       });
 
       server_.get("/slow", [](const request&, response& res) {
@@ -155,8 +217,9 @@ class working_test_server
          auto timer = std::make_shared<asio::steady_timer>(conn->socket_->get_executor());
          auto counter = std::make_shared<int>(0);
 
-         std::function<void(const std::error_code&)> send_data;
-         send_data = [conn, timer, counter, send_data](const std::error_code& ec) {
+         // Use shared_ptr to safely handle recursive lambda calls and avoid compiler-specific segfaults
+         auto send_data = std::make_shared<std::function<void(const std::error_code&)>>();
+         *send_data = [conn, timer, counter, send_data](const std::error_code& ec) {
             if (ec || !conn->is_open() || *counter >= 10) {
                if (conn->is_open()) conn->close();
                return;
@@ -169,15 +232,23 @@ class working_test_server
                                    return;
                                 }
                                 timer->expires_after(std::chrono::milliseconds(50));
-                                timer->async_wait(send_data);
+                                timer->async_wait(*send_data);
                              });
          };
-         timer->async_wait(send_data);
+         timer->async_wait(*send_data);
       });
 
       // Endpoint that immediately returns an error
       server_.stream_get("/stream-error", [](request&, streaming_response& res) {
          res.start_stream(403).close(); // e.g. Forbidden
+      });
+
+      // Endpoint that returns HTTP 200 but includes mixed success payloads (Typesense-style)
+      server_.stream_get("/stream-typesense", [](request&, streaming_response& res) {
+         res.start_stream(200, {{"Content-Type", "application/json"}});
+         res.send(R"({"success":false}\n)");
+         res.send(R"({"success":true}\n)");
+         res.close();
       });
    }
 
@@ -244,17 +315,29 @@ class simple_test_client
       return perform_request("POST", *url_parts, body);
    }
 
+   std::expected<response, std::error_code> options(
+      const std::string& url, const std::vector<std::pair<std::string, std::string>>& extra_headers)
+   {
+      auto url_parts = parse_url(url);
+      if (!url_parts) {
+         return std::unexpected(url_parts.error());
+      }
+
+      return perform_request("OPTIONS", *url_parts, "", extra_headers);
+   }
+
   private:
    asio::io_context io_context_;
    std::thread worker_thread_;
 
-   std::expected<response, std::error_code> perform_request(const std::string& method, const url_parts& url,
-                                                            const std::string& body)
+   std::expected<response, std::error_code> perform_request(
+      const std::string& method, const url_parts& url, const std::string& body,
+      std::vector<std::pair<std::string, std::string>> extra_headers = {})
    {
       std::promise<std::expected<response, std::error_code>> promise;
       auto future = promise.get_future();
 
-      asio::post(io_context_, [this, method, url, body, &promise]() {
+      asio::post(io_context_, [this, method, url, body, headers = std::move(extra_headers), &promise]() mutable {
          try {
             asio::ip::tcp::socket socket(io_context_);
             asio::ip::tcp::resolver resolver(io_context_);
@@ -267,6 +350,10 @@ class simple_test_client
             std::string request = method + " " + url.path + " HTTP/1.1\r\n";
             request += "Host: " + url.host + "\r\n";
             request += "Connection: close\r\n";
+
+            for (const auto& [name, value] : headers) {
+               request += name + ": " + value + "\r\n";
+            }
 
             if (!body.empty()) {
                request += "Content-Length: " + std::to_string(body.size()) + "\r\n";
@@ -296,10 +383,28 @@ class simple_test_client
                return;
             }
 
-            // Skip headers for simplicity
+            response resp;
+
             std::string header_line;
             while (std::getline(response_stream, header_line) && header_line != "\r") {
-               // Skip headers
+               if (!header_line.empty() && header_line.back() == '\r') {
+                  header_line.pop_back();
+               }
+
+               auto colon_pos = header_line.find(':');
+               if (colon_pos == std::string::npos) continue;
+
+               std::string name = header_line.substr(0, colon_pos);
+               std::string value = header_line.substr(colon_pos + 1);
+
+               value.erase(value.begin(), std::find_if(value.begin(), value.end(),
+                                                       [](unsigned char ch) { return !std::isspace(ch); }));
+               value.erase(
+                  std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(),
+                  value.end());
+
+               auto lower_name = glz::to_lower_case(name);
+               resp.response_headers[lower_name] = value;
             }
 
             // Read body
@@ -309,7 +414,6 @@ class simple_test_client
             std::string response_body{std::istreambuf_iterator<char>(&response_buffer),
                                       std::istreambuf_iterator<char>()};
 
-            response resp;
             resp.status_code = parsed_status->status_code;
             resp.response_body = response_body;
 
@@ -361,6 +465,204 @@ suite working_http_tests = [] {
 
       server.stop();
       std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Clean shutdown
+   };
+
+   "cors_preflight_generates_options_response"_test = [] {
+      working_test_server server;
+      expect(server.start()) << "Server should start\n";
+
+      simple_test_client client;
+      std::vector<std::pair<std::string, std::string>> headers = {
+         {"Origin", "http://localhost"},
+         {"Access-Control-Request-Method", "GET"},
+         {"Access-Control-Request-Headers", "X-Test-Header"},
+      };
+
+      auto result = client.options(server.base_url() + "/hello", headers);
+
+      expect(result.has_value()) << "OPTIONS preflight should succeed\n";
+      if (result.has_value()) {
+         expect(result->status_code == 204) << "Preflight should return HTTP 204\n";
+      }
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Clean shutdown
+   };
+
+   "cors_dynamic_origin_validation"_test = [] {
+      glz::cors_config config;
+      config.allowed_origins.clear();
+      config.allowed_origins_validator = [](std::string_view origin) {
+         return (origin.starts_with("http://") && origin.ends_with(".allowed.local")) ||
+                origin == "http://special.local";
+      };
+
+      working_test_server server;
+      server.set_cors_config(config);
+      expect(server.start()) << "Server should start\n";
+
+      simple_test_client client;
+      std::vector<std::pair<std::string, std::string>> headers = {
+         {"Origin", "http://app.allowed.local"},
+         {"Access-Control-Request-Method", "GET"},
+      };
+      auto allowed = client.options(server.base_url() + "/hello", headers);
+      expect(allowed.has_value()) << "OPTIONS preflight should succeed\n";
+      if (allowed.has_value()) {
+         expect(allowed->status_code == 204) << "Default status should remain 204\n";
+         auto origin_header = allowed->response_headers.find("access-control-allow-origin");
+         expect(origin_header != allowed->response_headers.end()) << "Allow-Origin header should be present\n";
+         if (origin_header != allowed->response_headers.end()) {
+            expect(origin_header->second == "http://app.allowed.local")
+               << "Origin should be echoed for allowed pattern\n";
+         }
+      }
+
+      headers[0].second = "http://special.local";
+      auto allowed_callback = client.options(server.base_url() + "/hello", headers);
+      expect(allowed_callback.has_value()) << "Dynamic callback origin should succeed\n";
+      if (allowed_callback.has_value()) {
+         expect(allowed_callback->status_code == 204);
+      }
+
+      headers[0].second = "http://denied.local";
+      auto denied = client.options(server.base_url() + "/hello", headers);
+      expect(denied.has_value()) << "Request should return a response even when denied\n";
+      if (denied.has_value()) {
+         expect(denied->status_code == 403) << "Denied origin should return 403\n";
+      }
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+   };
+
+   "cors_reflects_headers"_test = [] {
+      glz::cors_config config;
+      config.allowed_origins = {"http://client.local"};
+      config.allowed_methods = {"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"};
+      config.allowed_headers.clear();
+      config.options_success_status = 200;
+      config.max_age = 123;
+
+      working_test_server server;
+      server.set_cors_config(config);
+      expect(server.start()) << "Server should start\n";
+
+      simple_test_client client;
+      auto result = client.options(server.base_url() + "/hello", {{"Origin", "http://client.local"},
+                                                                  {"Access-Control-Request-Method", "GET"},
+                                                                  {"Access-Control-Request-Headers", "X-Test-Header"}});
+
+      expect(result.has_value()) << "OPTIONS preflight should succeed\n";
+      if (result.has_value()) {
+         expect(result->status_code == 200)
+            << "Configured OPTIONS status should be used (got " << result->status_code << ")\n";
+
+         auto methods_it = result->response_headers.find("access-control-allow-methods");
+         expect(methods_it != result->response_headers.end()) << "Allow-Methods header missing\n";
+         if (methods_it != result->response_headers.end()) {
+            expect(methods_it->second == "GET, HEAD, POST, PUT, DELETE, PATCH");
+         }
+
+         auto headers_it = result->response_headers.find("access-control-allow-headers");
+         expect(headers_it != result->response_headers.end());
+         if (headers_it != result->response_headers.end()) {
+            expect(headers_it->second == "X-Test-Header");
+         }
+
+         auto max_age_it = result->response_headers.find("access-control-max-age");
+         expect(max_age_it != result->response_headers.end());
+         if (max_age_it != result->response_headers.end()) {
+            expect(max_age_it->second == "123");
+         }
+      }
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+   };
+
+   "cors_allow_all_headers_flag"_test = [] {
+      glz::cors_config config;
+      config.allowed_origins = {"http://client.local"};
+      config.allowed_methods = {"*"};
+      config.allowed_headers = {"*"};
+
+      working_test_server server;
+      server.set_cors_config(config);
+      expect(server.start()) << "Server should start\n";
+
+      simple_test_client client;
+      auto result = client.options(server.base_url() + "/hello", {{"Origin", "http://client.local"},
+                                                                  {"Access-Control-Request-Method", "DELETE"},
+                                                                  {"Access-Control-Request-Headers", "X-One"}});
+
+      expect(result.has_value());
+      if (result.has_value()) {
+         auto headers_it = result->response_headers.find("access-control-allow-headers");
+         expect(headers_it != result->response_headers.end());
+         if (headers_it != result->response_headers.end()) {
+            expect(headers_it->second == "*") << "Expected * but got " << headers_it->second << "\n";
+         }
+      }
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+   };
+
+   "cors_preflight_rejects_missing_method"_test = [] {
+      working_test_server server;
+      expect(server.start()) << "Server should start\n";
+
+      simple_test_client client;
+      auto result = client.options(server.base_url() + "/hello",
+                                   {{"Origin", "http://client.local"}, {"Access-Control-Request-Method", "POST"}});
+
+      expect(result.has_value()) << "Preflight request should yield a response\n";
+      if (result.has_value()) {
+         expect(result->status_code == 405)
+            << "Preflight should return 405 when requested method is not implemented (got " << result->status_code
+            << ")\n";
+
+         auto allow_it = result->response_headers.find("allow");
+         expect(allow_it != result->response_headers.end()) << "Allow header must be present\n";
+         if (allow_it != result->response_headers.end()) {
+            expect(allow_it->second.find("GET") != std::string::npos)
+               << "Allow header should list the implemented method\n";
+         }
+      }
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+   };
+
+   "cors_wildcard_with_credentials_echoes_origin"_test = [] {
+      glz::cors_config config;
+      config.allowed_origins = {"*"};
+      config.allow_credentials = true;
+      config.allowed_methods = {"GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"};
+
+      working_test_server server;
+      server.set_cors_config(config);
+      expect(server.start()) << "Server should start\n";
+
+      simple_test_client client;
+      auto result = client.options(server.base_url() + "/hello",
+                                   {{"Origin", "http://auth.local"}, {"Access-Control-Request-Method", "POST"}});
+
+      expect(result.has_value());
+      if (result.has_value()) {
+         auto origin_it = result->response_headers.find("access-control-allow-origin");
+         expect(origin_it != result->response_headers.end());
+         if (origin_it != result->response_headers.end()) {
+            expect(origin_it->second == "http://auth.local");
+         }
+
+         auto credentials_it = result->response_headers.find("access-control-allow-credentials");
+         expect(credentials_it != result->response_headers.end());
+      }
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
    };
 
    "basic_post_request"_test = [] {
@@ -425,6 +727,15 @@ suite working_http_tests = [] {
       expect(!result.has_value()) << "Connection to closed port should fail\n";
    };
 
+   "http_status_error_category"_test = [] {
+      auto ec = make_http_status_error(502);
+
+      expect(ec.category() == http_status_category());
+      expect(ec.value() == 502);
+      expect(!ec.message().empty());
+      expect(ec.message().find("502") != std::string::npos);
+   };
+
    "concurrent_server_requests"_test = [] {
       working_test_server server;
       expect(server.start()) << "Server should start\n";
@@ -456,6 +767,51 @@ suite working_http_tests = [] {
 
 // Test suite for the main glz::http_client, including streaming
 suite glz_http_client_tests = [] {
+   "synchronous_put_request"_test = [] {
+      working_test_server server;
+      expect(server.start());
+
+      glz::http_client client;
+
+      std::unordered_map<std::string, std::string> headers{{"x-test-header", "header-value"}};
+      auto result = client.put(server.base_url() + "/update", "payload", headers);
+
+      expect(result.has_value()) << "PUT request should succeed";
+      if (result.has_value()) {
+         expect(result->status_code == 200) << "PUT status should be 200";
+         expect(result->response_body == "PUT:payload:header-value") << "Response body should echo payload and header";
+      }
+
+      server.stop();
+   };
+
+   "put_json_sets_content_type"_test = [] {
+      working_test_server server;
+      expect(server.start());
+
+      glz::http_client client;
+
+      test_http_client::put_payload payload{.value = 42, .message = "update"};
+
+      std::string expected_json;
+      auto ec = glz::write_json(payload, expected_json);
+      expect(!ec) << "Serializing payload should succeed";
+
+      std::unordered_map<std::string, std::string> extra_headers{{"x-extra", "value"}};
+      auto result = client.put_json(server.base_url() + "/json", payload, extra_headers);
+
+      expect(result.has_value()) << "PUT JSON request should succeed";
+      if (result.has_value()) {
+         expect(result->status_code == 200) << "PUT JSON status should be 200";
+         expect(result->response_body.find("CT=application/json") != std::string::npos)
+            << "Content-Type header should be forwarded";
+         expect(result->response_body.find("BODY=" + expected_json) != std::string::npos)
+            << "JSON body should be forwarded";
+      }
+
+      server.stop();
+   };
+
    "basic_streaming_get"_test = [] {
       working_test_server server;
       expect(server.start()) << "Server should start\n";
@@ -588,8 +944,14 @@ suite glz_http_client_tests = [] {
 
       auto on_data = [&](std::string_view) { data_received = true; };
       auto on_error = [&](std::error_code ec) {
-         // The client should translate the 4xx/5xx status into this error.
-         expect(ec == std::errc::connection_refused);
+         expect(bool(ec)) << "Expected an error code for HTTP failure";
+
+         auto status = http_status_from(ec);
+         expect(status.has_value()) << "Error should expose HTTP status";
+         if (status) {
+            expect(*status == 403) << "Unexpected HTTP status propagated: " << ec.message();
+         }
+
          error_received = true;
       };
       auto on_connect = [&](const response& headers) {
@@ -614,6 +976,86 @@ suite glz_http_client_tests = [] {
       expect(connected == true) << "on_connect should be called with error headers\n";
       expect(error_received == true) << "on_error was not called for HTTP error status\n";
       expect(data_received == false) << "on_data should not be called on error\n";
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+   };
+
+   "streaming_request_with_custom_status_predicate"_test = [] {
+      working_test_server server;
+      expect(server.start()) << "Server should start\n";
+
+      glz::http_client client;
+
+      std::atomic<bool> connected = false;
+      std::atomic<bool> error_received = false;
+      std::promise<void> disconnect_promise;
+      auto disconnect_future = disconnect_promise.get_future();
+
+      auto on_data = [&](std::string_view data) {
+         // Capture any payload for later inspection
+         (void)data;
+      };
+      auto on_error = [&](std::error_code) { error_received = true; };
+      auto on_connect = [&](const response& headers) {
+         expect(headers.status_code == 403);
+         connected = true;
+      };
+      auto on_disconnect = [&]() { disconnect_promise.set_value(); };
+
+      auto conn = client.stream_request({.url = server.base_url() + "/stream-error",
+                                         .on_data = on_data,
+                                         .on_error = on_error,
+                                         .method = "GET",
+                                         .on_connect = on_connect,
+                                         .on_disconnect = on_disconnect,
+                                         .status_is_error = [](int status) { return status >= 500; }});
+      expect(conn != nullptr);
+
+      auto status = disconnect_future.wait_for(std::chrono::seconds(2));
+      expect(status == std::future_status::ready) << "Disconnect was not called\n";
+
+      expect(connected == true) << "on_connect should run";
+      expect(error_received == false) << "Custom predicate should suppress 4xx error";
+
+      server.stop();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+   };
+
+   "streaming_request_custom_predicate_flags_success"_test = [] {
+      working_test_server server;
+      expect(server.start()) << "Server should start\n";
+
+      glz::http_client client;
+
+      std::atomic<bool> error_received = false;
+      std::promise<void> disconnect_promise;
+      auto disconnect_future = disconnect_promise.get_future();
+
+      auto on_data = [&](std::string_view) { /* no-op */ };
+      auto on_error = [&](std::error_code ec) {
+         error_received = true;
+         auto status = http_status_from(ec);
+         expect(status.has_value());
+         if (status) {
+            expect(*status == 200);
+         }
+      };
+      auto on_connect = [&](const response& headers) { expect(headers.status_code == 200); };
+      auto on_disconnect = [&]() { disconnect_promise.set_value(); };
+
+      auto conn = client.stream_request({.url = server.base_url() + "/stream-typesense",
+                                         .on_data = on_data,
+                                         .on_error = on_error,
+                                         .method = "GET",
+                                         .on_connect = on_connect,
+                                         .on_disconnect = on_disconnect,
+                                         .status_is_error = [](int status) { return status == 200; }});
+      expect(conn != nullptr);
+
+      auto status = disconnect_future.wait_for(std::chrono::seconds(2));
+      expect(status == std::future_status::ready);
+      expect(error_received == true);
 
       server.stop();
       std::this_thread::sleep_for(std::chrono::milliseconds(50));

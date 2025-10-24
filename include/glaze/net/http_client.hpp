@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "glaze/net/http_router.hpp"
+#include "glaze/util/key_transformers.hpp"
 
 namespace glz
 {
@@ -203,7 +204,8 @@ namespace glz
 
    // Handler function types for streaming
    using http_data_handler = std::function<void(std::string_view data)>;
-   using http_error_handler = std::function<void(std::error_code ec)>;
+   using http_error_handler =
+      std::function<void(std::error_code ec)>; // May carry HTTP statuses via http_status_category()
    using http_connect_handler = std::function<void(const response& headers)>;
    using http_disconnect_handler = std::function<void()>;
 
@@ -216,6 +218,7 @@ namespace glz
       bool is_connected{false};
       std::atomic<bool> should_stop{false};
       stream_read_strategy strategy{stream_read_strategy::bulk_transfer}; // Default strategy
+      std::function<bool(int)> status_is_error{}; // Evaluated before treating status as failure
 
       // Constructor with optional buffer size limit and strategy
       http_stream_connection(size_t max_buffer_size = 1024 * 1024,
@@ -257,6 +260,7 @@ namespace glz
       http_disconnect_handler on_disconnect{};
       std::chrono::seconds timeout{std::chrono::seconds{30}};
       stream_read_strategy strategy{stream_read_strategy::bulk_transfer};
+      std::function<bool(int)> status_is_error{}; // Custom predicate to decide whether a status code should fail
    };
 
    struct http_client
@@ -294,6 +298,18 @@ namespace glz
          return perform_sync_request("POST", *url_result, body, headers);
       }
 
+      // Synchronous PUT request - truly synchronous, no promises/futures
+      std::expected<response, std::error_code> put(std::string_view url, const std::string& body,
+                                                   const std::unordered_map<std::string, std::string>& headers = {})
+      {
+         auto url_result = parse_url(url);
+         if (!url_result) {
+            return std::unexpected(url_result.error());
+         }
+
+         return perform_sync_request("PUT", *url_result, body, headers);
+      }
+
       // Synchronous JSON POST request
       template <class T>
       std::expected<response, std::error_code> post_json(
@@ -306,9 +322,26 @@ namespace glz
          }
 
          auto merged_headers = headers;
-         merged_headers["Content-Type"] = "application/json";
+         merged_headers["content-type"] = "application/json";
 
          return post(url, json_str, merged_headers);
+      }
+
+      // Synchronous JSON PUT request
+      template <class T>
+      std::expected<response, std::error_code> put_json(
+         std::string_view url, const T& data, const std::unordered_map<std::string, std::string>& headers = {})
+      {
+         std::string json_str;
+         auto ec = glz::write_json(data, json_str);
+         if (ec) {
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+         }
+
+         auto merged_headers = headers;
+         merged_headers["content-type"] = "application/json";
+
+         return put(url, json_str, merged_headers);
       }
 
       // New unified streaming request method
@@ -324,8 +357,8 @@ namespace glz
          std::string method = params.method.empty() ? "GET" : params.method;
 
          return perform_stream_request(method, *url_result, params.body, params.headers, params.timeout,
-                                       params.strategy, params.on_data, params.on_error, params.on_connect,
-                                       params.on_disconnect);
+                                       params.strategy, params.status_is_error, params.on_data, params.on_error,
+                                       params.on_connect, params.on_disconnect);
       }
 
       // Asynchronous GET request
@@ -404,7 +437,7 @@ namespace glz
          }
 
          auto merged_headers = headers;
-         merged_headers["Content-Type"] = "application/json";
+         merged_headers["content-type"] = "application/json";
 
          post_async(url, json_str, merged_headers, std::forward<CompletionHandler>(handler));
       }
@@ -469,12 +502,17 @@ namespace glz
       std::shared_ptr<http_stream_connection> perform_stream_request(
          const std::string& method, const url_parts& url, const std::string& body,
          const std::unordered_map<std::string, std::string>& headers, std::chrono::seconds timeout,
-         stream_read_strategy strategy, http_data_handler on_data, http_error_handler on_error,
-         http_connect_handler on_connect, http_disconnect_handler on_disconnect)
+         stream_read_strategy strategy, std::function<bool(int)> status_is_error, http_data_handler on_data,
+         http_error_handler on_error, http_connect_handler on_connect, http_disconnect_handler on_disconnect)
       {
          auto connection = std::make_shared<http_stream_connection>(1024 * 1024, strategy);
          connection->socket = connection_pool->get_connection(url.host, url.port);
          connection->timer = std::make_shared<asio::steady_timer>(*async_io_context);
+
+         connection->status_is_error = std::move(status_is_error);
+         if (!connection->status_is_error) {
+            connection->status_is_error = [](int status) { return status >= 400; };
+         }
 
          // Wrap the disconnect handler to return the socket to the pool
          auto internal_on_disconnect = [this, user_on_disconnect = std::move(on_disconnect), connection, url]() {
@@ -613,7 +651,7 @@ namespace glz
                }
 
                // Create a zero-copy string_view of the received headers
-               std::string_view header_data{asio::buffer_cast<const char*>(connection->buffer->data()),
+               std::string_view header_data{static_cast<const char*>(connection->buffer->data().data()),
                                             bytes_transferred};
 
                // Parse status line
@@ -655,8 +693,8 @@ namespace glz
                      size_t value_start = header_line.find_first_not_of(" \t", colon_pos + 1);
                      std::string_view value = (value_start != std::string::npos) ? header_line.substr(value_start) : "";
 
-                     // Create strings only when inserting into the map
-                     response_headers.response_headers[std::string(name)] = std::string(value);
+                     // Convert header name to lowercase for case-insensitive lookups (RFC 7230)
+                     response_headers.response_headers[to_lower_case(name)] = std::string(value);
                   }
                }
 
@@ -670,15 +708,19 @@ namespace glz
                   on_connect(response_headers);
                }
 
-               if (parsed_status->status_code >= 400) {
-                  // Status code indicates an error, so we report it and end the stream.
-                  on_error(std::make_error_code(std::errc::connection_refused)); // Generic error for now
+               const bool status_is_error = connection->status_is_error
+                                               ? connection->status_is_error(parsed_status->status_code)
+                                               : parsed_status->status_code >= 400;
+
+               if (status_is_error) {
+                  // Propagate the precise HTTP status via a dedicated error category.
+                  on_error(make_http_status_error(parsed_status->status_code));
                   if (on_disconnect) on_disconnect();
                   return;
                }
 
                bool is_chunked = false;
-               auto it = response_headers.response_headers.find("Transfer-Encoding");
+               auto it = response_headers.response_headers.find("transfer-encoding");
                if (it != response_headers.response_headers.end()) {
                   if (it->second.find("chunked") != std::string::npos) {
                      is_chunked = true;
@@ -716,7 +758,7 @@ namespace glz
                   return;
                }
 
-               std::string_view line_view{asio::buffer_cast<const char*>(connection->buffer->data()),
+               std::string_view line_view{static_cast<const char*>(connection->buffer->data().data()),
                                           bytes_transferred - 2}; // -2 to exclude CRLF
 
                // Ignore chunk extensions
@@ -758,7 +800,7 @@ namespace glz
 
          // Check if we have enough data in the buffer already.
          if (connection->buffer->size() >= total_to_read) {
-            std::string_view data{asio::buffer_cast<const char*>(connection->buffer->data()), chunk_size};
+            std::string_view data{static_cast<const char*>(connection->buffer->data().data()), chunk_size};
             on_data(data);
             connection->buffer->consume(total_to_read);
 
@@ -784,7 +826,7 @@ namespace glz
                   return;
                }
 
-               std::string_view data{asio::buffer_cast<const char*>(connection->buffer->data()), chunk_size};
+               std::string_view data{static_cast<const char*>(connection->buffer->data().data()), chunk_size};
                on_data(data);
                connection->buffer->consume(chunk_size + 2); // Consume data + trailing CRLF
 
@@ -812,7 +854,7 @@ namespace glz
       {
          // Process any existing data in buffer first
          if (connection->buffer->size() > 0) {
-            std::string_view data{asio::buffer_cast<const char*>(connection->buffer->data()),
+            std::string_view data{static_cast<const char*>(connection->buffer->data().data()),
                                   connection->buffer->size()};
             on_data(data);
             connection->buffer->consume(connection->buffer->size());
@@ -846,7 +888,7 @@ namespace glz
       {
          // Process existing buffer content first
          if (connection->buffer->size() > 0) {
-            std::string_view data{asio::buffer_cast<const char*>(connection->buffer->data()),
+            std::string_view data{static_cast<const char*>(connection->buffer->data().data()),
                                   connection->buffer->size()};
             on_data(data);
             connection->buffer->consume(connection->buffer->size());
@@ -873,7 +915,7 @@ namespace glz
                // Commit the received data and deliver immediately
                connection->buffer->commit(bytes_transferred);
 
-               std::string_view data{asio::buffer_cast<const char*>(connection->buffer->data()), bytes_transferred};
+               std::string_view data{static_cast<const char*>(connection->buffer->data().data()), bytes_transferred};
                on_data(data);
                connection->buffer->consume(bytes_transferred);
 
@@ -936,7 +978,7 @@ namespace glz
             }
 
             // Create a zero-copy view of the header data
-            std::string_view header_data{asio::buffer_cast<const char*>(response_buffer.data()), header_bytes};
+            std::string_view header_data{static_cast<const char*>(response_buffer.data().data()), header_bytes};
 
             // Parse status line from the view
             auto line_end = header_data.find("\r\n");
@@ -979,7 +1021,8 @@ namespace glz
                      }
                   }
 
-                  response_headers.emplace(name, value);
+                  // Convert header name to lowercase for case-insensitive lookups (RFC 7230)
+                  response_headers.emplace(to_lower_case(name), value);
                }
             }
 
@@ -999,7 +1042,7 @@ namespace glz
             }
 
             // Create the body string from the buffer, respecting content_length.
-            std::string response_body(asio::buffer_cast<const char*>(response_buffer.data()),
+            std::string response_body(static_cast<const char*>(response_buffer.data().data()),
                                       std::min(content_length, response_buffer.size()));
 
             response resp;
@@ -1138,7 +1181,7 @@ namespace glz
                                size_t header_size, // <-- NEW: The size of the header block from async_read_until
                                const url_parts& url, CompletionHandler&& handler)
       {
-         std::string_view header_section{asio::buffer_cast<const char*>(buffer->data()), header_size};
+         std::string_view header_section{static_cast<const char*>(buffer->data().data()), header_size};
 
          // Parse the status line from the view.
          auto line_end = header_section.find("\r\n");
@@ -1180,8 +1223,8 @@ namespace glz
                    glz::strncasecmp(name.data(), "Content-Length", 14) == 0) {
                   std::from_chars(value.data(), value.data() + value.size(), content_length);
                }
-               // Store the header, creating strings only at the last moment.
-               response_headers.emplace(name, value);
+               // Convert header name to lowercase for case-insensitive lookups (RFC 7230)
+               response_headers.emplace(to_lower_case(name), value);
             }
          }
 
@@ -1206,7 +1249,7 @@ namespace glz
                }
 
                // Directly construct the string from the buffer's contiguous memory.
-               std::string body(asio::buffer_cast<const char*>(buffer->data()), buffer->size());
+               std::string body(static_cast<const char*>(buffer->data().data()), buffer->size());
 
                response resp;
                resp.status_code = status_code;
@@ -1214,7 +1257,7 @@ namespace glz
                resp.response_body = std::move(body);
 
                // Return connection to pool if it's still usable
-               auto connection_header = resp.response_headers.find("Connection");
+               auto connection_header = resp.response_headers.find("connection");
                if (connection_header == resp.response_headers.end() ||
                    connection_header->second.find("close") == std::string::npos) {
                   connection_pool->return_connection(url.host, url.port, socket);

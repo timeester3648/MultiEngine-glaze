@@ -11,11 +11,13 @@
 #include <numbers>
 #include <random>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "glaze/api/impl.hpp"
 #include "glaze/base64/base64.hpp"
 #include "glaze/beve/beve_to_json.hpp"
+#include "glaze/beve/key_traits.hpp"
 #include "glaze/beve/read.hpp"
 #include "glaze/beve/write.hpp"
 #include "glaze/hardware/volatile_array.hpp"
@@ -24,7 +26,141 @@
 #include "glaze/trace/trace.hpp"
 #include "ut/ut.hpp"
 
+using namespace ut;
+
 inline glz::trace trace{};
+
+struct ModuleID
+{
+   uint64_t value{};
+
+   auto operator<=>(const ModuleID&) const = default;
+};
+
+template <>
+struct glz::meta<ModuleID>
+{
+   static constexpr auto value = &ModuleID::value;
+};
+
+struct CastModuleID
+{
+   uint64_t value{};
+
+   auto operator<=>(const CastModuleID&) const = default;
+};
+
+template <>
+struct glz::meta<CastModuleID>
+{
+   static constexpr auto value = glz::cast<&CastModuleID::value, uint64_t>;
+};
+
+template <>
+struct std::hash<ModuleID>
+{
+   size_t operator()(const ModuleID& id) const noexcept { return std::hash<uint64_t>{}(id.value); }
+};
+
+struct beve_concat_opts : glz::opts
+{
+   bool concatenate = true;
+};
+
+template <>
+struct std::hash<CastModuleID>
+{
+   size_t operator()(const CastModuleID& id) const noexcept { return std::hash<uint64_t>{}(id.value); }
+};
+
+namespace
+{
+   template <class ID>
+   constexpr ID make_id(const uint64_t value)
+   {
+      return ID{value};
+   }
+
+   template <class ID>
+   void verify_map_roundtrip()
+   {
+      const std::map<ID, std::string> src{{make_id<ID>(42), "life"}, {make_id<ID>(9001), "power"}};
+
+      std::string buffer{};
+      expect(not glz::write_beve(src, buffer));
+
+      expect(static_cast<uint8_t>(buffer[0]) == glz::beve_key_traits<ID>::header);
+
+      std::map<ID, std::string> dst{};
+      expect(!glz::read_beve(dst, buffer));
+      expect(dst == src);
+
+      std::string json{};
+      expect(!glz::beve_to_json(buffer, json));
+      expect(json == R"({"42":"life","9001":"power"})") << json;
+   }
+
+   template <class ID>
+   void verify_unordered_map_roundtrip()
+   {
+      const std::unordered_map<ID, int> src{
+         {make_id<ID>(1), 7},
+         {make_id<ID>(2), 11},
+         {make_id<ID>(99), -4},
+      };
+
+      std::string buffer{};
+      expect(not glz::write_beve(src, buffer));
+
+      std::unordered_map<ID, int> dst{};
+      expect(!glz::read_beve(dst, buffer));
+      expect(dst == src);
+
+      std::string json{};
+      expect(!glz::beve_to_json(buffer, json));
+
+      std::map<std::string, int> decoded{};
+      expect(!glz::read_json(decoded, json));
+      expect(decoded == std::map<std::string, int>{{"1", 7}, {"2", 11}, {"99", -4}});
+   }
+
+   template <class ID>
+   void verify_no_header_raw_bytes()
+   {
+      ID id{0x1122334455667788ULL};
+
+      std::string buffer{};
+      size_t ix{};
+      glz::context ctx{};
+
+      glz::serialize<glz::BEVE>::no_header<glz::opts{}>(id, ctx, buffer, ix);
+
+      expect(ix == sizeof(uint64_t));
+      expect(buffer.size() >= ix);
+
+      uint64_t raw{};
+      std::memcpy(&raw, buffer.data(), sizeof(raw));
+      expect(raw == id.value);
+   }
+
+   template <class ID>
+   void verify_vector_pair_roundtrip()
+   {
+      constexpr beve_concat_opts beve_concat{{glz::BEVE}};
+      const std::vector<std::pair<ID, int>> src{{make_id<ID>(5), 13}, {make_id<ID>(7), 17}};
+
+      std::string buffer{};
+      expect(not glz::write<beve_concat>(src, buffer));
+
+      std::vector<std::pair<ID, int>> dst{};
+      expect(!glz::read<beve_concat>(dst, buffer));
+      expect(dst == src);
+
+      std::string json{};
+      expect(!glz::beve_to_json(buffer, json));
+      expect(json == R"({"5":13,"7":17})") << json;
+   }
+}
 
 struct my_struct
 {
@@ -1530,6 +1666,20 @@ suite glz_text_tests = [] {
    };
 };
 
+suite beve_custom_key_tests = [] {
+   "map ModuleID"_test = [] { verify_map_roundtrip<ModuleID>(); };
+   "map CastModuleID"_test = [] { verify_map_roundtrip<CastModuleID>(); };
+
+   "unordered_map ModuleID"_test = [] { verify_unordered_map_roundtrip<ModuleID>(); };
+   "unordered_map CastModuleID"_test = [] { verify_unordered_map_roundtrip<CastModuleID>(); };
+
+   "no_header ModuleID"_test = [] { verify_no_header_raw_bytes<ModuleID>(); };
+   "no_header CastModuleID"_test = [] { verify_no_header_raw_bytes<CastModuleID>(); };
+
+   "vector pair ModuleID"_test = [] { verify_vector_pair_roundtrip<ModuleID>(); };
+   "vector pair CastModuleID"_test = [] { verify_vector_pair_roundtrip<CastModuleID>(); };
+};
+
 suite beve_to_json_tests = [] {
    "beve_to_json bool"_test = [] {
       bool b = true;
@@ -2128,9 +2278,9 @@ suite volatile_tests = [] {
    };
 };
 
-suite json_t_tests = [] {
-   "json_t"_test = [] {
-      glz::json_t json("Hello World");
+suite generic_tests = [] {
+   "generic"_test = [] {
+      glz::generic json("Hello World");
       auto b = glz::write_beve(json).value_or("error");
 
       json = nullptr;
@@ -2139,8 +2289,8 @@ suite json_t_tests = [] {
       expect(json.get_string() == "Hello World");
    };
 
-   "json_t"_test = [] {
-      glz::json_t json{{"i", 42}};
+   "generic"_test = [] {
+      glz::generic json{{"i", 42}};
       auto b = glz::write_beve(json).value_or("error");
 
       json = nullptr;
@@ -2150,8 +2300,8 @@ suite json_t_tests = [] {
       expect(json["i"].get_number() == 42);
    };
 
-   "json_t"_test = [] {
-      glz::json_t json{{"str", "somewhere"}, {"arr", {1, 2, 3}}};
+   "generic"_test = [] {
+      glz::generic json{{"str", "somewhere"}, {"arr", {1, 2, 3}}};
       auto b = glz::write_beve(json).value_or("error");
 
       json = nullptr;
@@ -2162,8 +2312,8 @@ suite json_t_tests = [] {
       expect(json["arr"].get_array().size() == 3);
    };
 
-   "json_t"_test = [] {
-      glz::json_t json{1, 2, 3};
+   "generic"_test = [] {
+      glz::generic json{1, 2, 3};
       auto b = glz::write_beve(json).value_or("error");
 
       json = nullptr;
@@ -2179,7 +2329,7 @@ suite early_end = [] {
 
    "early_end"_test = [] {
       Thing obj{};
-      glz::json_t json{};
+      glz::generic json{};
       glz::skip skip_me{};
       std::string buffer_data = glz::write_beve(obj).value();
       std::string_view buffer = buffer_data;
@@ -2203,7 +2353,7 @@ suite early_end = [] {
       static constexpr glz::opts options{.format = glz::BEVE, .null_terminated = false};
 
       Thing obj{};
-      glz::json_t json{};
+      glz::generic json{};
       glz::skip skip_me{};
       std::string buffer_data = glz::write_beve(obj).value();
       std::vector<char> temp{buffer_data.begin(), buffer_data.end()};
@@ -2222,6 +2372,51 @@ suite early_end = [] {
          expect(ec);
          expect(ec.location <= buffer.size());
       }
+   };
+};
+
+struct empty_string_test_struct
+{
+   std::string empty_field = "";
+   int num = 42;
+};
+
+suite empty_string_test = [] {
+   "empty string at buffer boundary"_test = [] {
+      // Test case for the issue where ix == b.size() and str.size() == 0
+      // causes an assert inside std::vector::operator[]
+      std::string empty_str = "";
+      std::string buffer;
+      expect(not glz::write_beve(empty_str, buffer));
+
+      // Test reading back
+      std::string result;
+      expect(!glz::read_beve(result, buffer));
+      expect(result == empty_str);
+   };
+
+   "empty string in struct"_test = [] {
+      empty_string_test_struct obj;
+      std::string buffer;
+      expect(not glz::write_beve(obj, buffer));
+
+      empty_string_test_struct result;
+      expect(!glz::read_beve(result, buffer));
+      expect(result.empty_field == "");
+      expect(result.num == 42);
+   };
+
+   "multiple empty strings"_test = [] {
+      std::vector<std::string> empty_strings = {"", "", ""};
+      std::string buffer;
+      expect(not glz::write_beve(empty_strings, buffer));
+
+      std::vector<std::string> result;
+      expect(!glz::read_beve(result, buffer));
+      expect(result.size() == 3);
+      expect(result[0] == "");
+      expect(result[1] == "");
+      expect(result[2] == "");
    };
 };
 
@@ -2477,6 +2672,164 @@ suite pair_ranges_tests = [] {
       std::vector<std::pair<int, int>> x;
       expect(!glz::read_beve(x, s));
       expect(x == v);
+   };
+};
+
+// Test for static variant tags with empty structs
+namespace static_tag_test
+{
+   enum class MsgTypeEmpty { A, B };
+
+   struct MsgAEmpty
+   {
+      static constexpr auto type = MsgTypeEmpty::A;
+   };
+
+   struct MsgBEmpty
+   {
+      static constexpr auto type = MsgTypeEmpty::B;
+   };
+
+   using MsgEmpty = std::variant<MsgAEmpty, MsgBEmpty>;
+
+   enum class MsgType { A, B };
+
+   struct MsgA
+   {
+      static constexpr auto type = MsgType::A;
+      int value = 42;
+   };
+
+   struct MsgB
+   {
+      static constexpr auto type = MsgType::B;
+      std::string text = "hello";
+   };
+
+   using Msg = std::variant<MsgA, MsgB>;
+}
+
+suite static_variant_tags = [] {
+   "static variant tags with empty structs"_test = [] {
+      using namespace static_tag_test;
+
+      // Test untagged BEVE with empty structs having static tags
+      {
+         MsgEmpty original{MsgAEmpty{}};
+         auto encoded = glz::write_beve_untagged(original);
+         expect(encoded.has_value());
+
+         auto decoded = glz::read_binary_untagged<MsgEmpty>(*encoded);
+         expect(decoded.has_value());
+         expect(decoded->index() == 0);
+      }
+
+      {
+         MsgEmpty original{MsgBEmpty{}};
+         auto encoded = glz::write_beve_untagged(original);
+         expect(encoded.has_value());
+
+         auto decoded = glz::read_binary_untagged<MsgEmpty>(*encoded);
+         expect(decoded.has_value());
+         expect(decoded->index() == 1);
+      }
+   };
+
+   "static variant tags with non-empty structs"_test = [] {
+      using namespace static_tag_test;
+
+      // Test untagged BEVE with non-empty structs having static tags
+      {
+         Msg original{MsgA{}};
+         auto encoded = glz::write_beve_untagged(original);
+         expect(encoded.has_value());
+
+         auto decoded = glz::read_binary_untagged<Msg>(*encoded);
+         expect(decoded.has_value());
+         expect(decoded->index() == 0);
+         expect(std::get<0>(*decoded).value == 42);
+      }
+
+      {
+         Msg original{MsgB{}};
+         auto encoded = glz::write_beve_untagged(original);
+         expect(encoded.has_value());
+
+         auto decoded = glz::read_binary_untagged<Msg>(*encoded);
+         expect(decoded.has_value());
+         expect(decoded->index() == 1);
+         expect(std::get<1>(*decoded).text == "hello");
+      }
+   };
+};
+
+suite explicit_string_view_support = [] {
+   "write beve from explicit string_view"_test = [] {
+      struct explicit_string_view_type
+      {
+         std::string storage{};
+
+         explicit explicit_string_view_type(std::string_view s) : storage(s) {}
+
+         explicit operator std::string_view() const noexcept { return storage; }
+      };
+
+      explicit_string_view_type value{std::string_view{"explicit"}};
+
+      std::string buffer{};
+      expect(not glz::write_beve(value, buffer));
+      expect(not buffer.empty());
+
+      std::string decoded{};
+      expect(not glz::read_beve(decoded, buffer));
+      expect(decoded == "explicit");
+   };
+};
+
+struct MemberFunctionThingBeve
+{
+   std::string name{};
+   auto get_description() const -> std::string { return "something"; }
+};
+
+namespace glz
+{
+   template <>
+   struct meta<MemberFunctionThingBeve>
+   {
+      using T = MemberFunctionThingBeve;
+      static constexpr auto value = object("name", &T::name, "description", &T::get_description);
+   };
+} // namespace glz
+
+suite member_function_pointer_beve_serialization = [] {
+   "member function pointer skipped in beve write"_test = [] {
+      MemberFunctionThingBeve input{};
+      input.name = "test_item";
+      std::string buffer{};
+      expect(not glz::write_beve(input, buffer));
+
+      MemberFunctionThingBeve output{};
+      expect(not glz::read_beve(output, buffer));
+      expect(output.name == input.name);
+   };
+
+   "member function pointer opt-in write encodes description key"_test = [] {
+      MemberFunctionThingBeve input{};
+      input.name = "test_item";
+
+      std::string buffer_default{};
+      expect(not glz::write_beve(input, buffer_default));
+      expect(buffer_default.find("description") == std::string::npos);
+
+      struct opts_with_member_functions : glz::opts
+      {
+         bool write_member_functions = true;
+      };
+
+      std::string buffer_opt_in{};
+      expect(not glz::write<glz::set_beve<opts_with_member_functions{}>()>(input, buffer_opt_in));
+      expect(buffer_opt_in.find("description") != std::string::npos);
    };
 };
 

@@ -15,8 +15,9 @@ glz::http_server server;
 server.enable_cors();
 
 // Good for development, allows all origins and methods
-server.bind(8080);
+server.bind(8080).with_signals();
 server.start();
+server.wait_for_signal(); // Block until Ctrl+C
 ```
 
 ### Production CORS Configuration
@@ -34,12 +35,15 @@ server.enable_cors(allowed_origins, true); // Allow credentials
 // Or use detailed configuration
 glz::cors_config config;
 config.allowed_origins = {"https://myapp.com", "https://app.myapp.com"};
+config.allowed_origins_validator = [](std::string_view origin) {
+    return origin.ends_with(".partner.myapp.com");
+};
 config.allowed_methods = {"GET", "POST", "PUT", "DELETE"};
 config.allowed_headers = {"Content-Type", "Authorization", "X-API-Key"};
 config.exposed_headers = {"X-Total-Count", "X-Page-Info"};
 config.allow_credentials = true;
 config.max_age = 3600; // 1 hour preflight cache
-config.handle_preflight = true;
+config.options_success_status = 200; // Use legacy-friendly 200 instead of 204
 
 server.enable_cors(config);
 ```
@@ -50,6 +54,9 @@ server.enable_cors(config);
 // Create custom CORS handler
 auto custom_cors = glz::create_cors_middleware({
     .allowed_origins = {"https://trusted-site.com"},
+    .allowed_origins_validator = [](std::string_view origin) {
+        return origin.ends_with(".trusted-site.com");
+    },
     .allowed_methods = {"GET", "POST"},
     .allowed_headers = {"Content-Type", "Authorization"},
     .allow_credentials = true,
@@ -71,6 +78,15 @@ server.get("/test-cors", [](const glz::request& req, glz::response& res) {
     });
 });
 ```
+
+### Automatic Preflight Handling
+
+The server builds the `Allow` header dynamically, and runs middleware (including CORS) before returning a response. If the origin is denied the preflight receives `403`; if the browser asks for a verb that is not implemented the server answers with `405` (after running middleware so diagnostics still flow); otherwise the CORS middleware fills in the appropriate `Access-Control-Allow-*` headers.
+
+### Extended CORS Configuration
+
+- **Dynamic origins** – `allowed_origins_validator` let you accept wildcard domains or perform per-request checks.
+- **Custom preflight status** – override `options_success_status` if a client expects `200` instead of `204`.
 
 ## WebSocket Support
 
@@ -112,8 +128,9 @@ ws_server->on_error([](std::shared_ptr<glz::websocket_connection> conn, std::err
 glz::http_server server;
 server.websocket("/ws", ws_server);
 
-server.bind(8080);
+server.bind(8080).with_signals();
 server.start();
+server.wait_for_signal();
 ```
 
 ### Chat Room Example
@@ -228,8 +245,9 @@ server.get("/secure-data", [](const glz::request& req, glz::response& res) {
     });
 });
 
-server.bind(8443); // Standard HTTPS port
+server.bind(8443).with_signals(); // Standard HTTPS port
 server.start();
+server.wait_for_signal();
 ```
 
 ---

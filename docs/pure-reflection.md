@@ -10,9 +10,59 @@ Glaze supports pure reflection for [aggregate initializable](https://en.cpprefer
 > - no [virtual base classes](https://en.cppreference.com/w/cpp/language/derived_class#Virtual_base_classes)
 
 There's no need to write any `glz::meta` structures or use any macros. The reflection is hidden from
-the user and computed at compile time.
+the user and computed at compile time. If you eventually need to rename just a couple of fields or add
+an alias while keeping everything else automatic, specialize `glz::meta<T>` with a
+[`modify`](modify-reflection.md) object. The existing members stay under pure reflection; only the keys you
+mention are altered or appended.
 
-- You can still write a `glz::meta` to customize your serialization, which will override the default reflection.
+Types that support pure reflection satisfy the `glz::reflectable<T>` concept. To check if any type (including those with `glz::meta` specializations) can use the reflection API, use the `glz::has_reflect<T>` concept.
+
+- You can still write a full `glz::meta` to customize your serialization, which will override the default reflection entirely.
+
+## Treating reflected structs as positional arrays
+
+Some JSON use cases employ arrays even though the target type is a struct. Wrap a member with `glz::as_array<&T::member>` to map between the positional representation and your reflected struct.
+
+```c++
+struct Person_details
+{
+   std::string_view name;
+   std::string_view surname;
+   std::string_view city;
+   std::string_view street;
+};
+
+struct Person
+{
+   int id{};
+   Person_details person{};
+};
+
+template <>
+struct glz::meta<Person>
+{
+   using T = Person;
+   static constexpr auto value = glz::object(
+      "id", &T::id,
+      "person", glz::as_array<&T::person> // consume a JSON array as Person_details
+   );
+};
+
+std::string_view payload = R"({
+   "id": 1,
+   "person": ["Joe", "Doe", "London", "Chamber St"]
+})";
+
+Person p{};
+if (auto ec = glz::read_json(p, payload); ec) {
+   throw std::runtime_error(glz::format_error(ec, payload));
+}
+
+auto out = glz::write_json(p).value();
+// out == R"({"id":1,"person":["Joe","Doe","London","Chamber St"]})"
+```
+
+`glz::as_array` relies on the wrapped type's reflection (pure reflection or an explicit `glz::meta`) to map each array element by index. Serialization uses that same order to emit an array, so you get positional reads and writes while the C++ type stays a struct. The wrapper works for JSON, BEVE, CSV, TOML, and any other Glaze format.
 
 > CUSTOMIZATION NOTE:
 >
@@ -52,4 +102,3 @@ struct V2Wrapper
    V2 x{}; // reflection wouldn't work except for adding `V2(glz::make_reflectable) {}`
 };
 ```
-

@@ -3,10 +3,22 @@ One of the fastest JSON libraries in the world. Glaze reads and writes from obje
 
 Glaze also supports:
 
-- [BEVE](https://github.com/beve-org/beve) (binary efficient versatile encoding)
-- [CSV](./docs/csv.md) (comma separated value)
+- [BEVE](https://github.com/beve-org/beve) (Binary Efficient Versatile Encoding)
+- [CSV](./docs/csv.md) (Comma Separated Value)
+- [TOML](./docs/toml.md) (Tom's Obvious, Minimal Language)
 - [Stencil/Mustache](./docs/stencil-mustache.md) (string interpolation)
 - [EETF](./docs/EETF/erlang-external-term-format.md) (Erlang External Term Format) [optionally included]
+
+> [!IMPORTANT]
+>
+> ## Breaking v6.0.0 changes
+>
+> - `glz::json_t` has been renamed to `glz::generic` and will be deprecated in v6.0.0. Update your code to include `glaze/json/generic.hpp` and prefer `glz::generic` to stay aligned with the upcoming release.
+> - Removed `v5.6.0` Glaze C FFI interop. This was a significant experiment that looked like would take off and be extremely useful, but after attempting to use it in production it became clear that the developers wouldn't use this feature and instead create a low-level C API. Someone could create a third party library with the code, but it has been removed from Glaze to focus on more critical features.
+
+> [!IMPORTANT]
+>
+> Pure reflection now supports partial modifications through `glz::meta<T>::modify` so you can alias or wrap just a few members without giving up automatic metadata. Learn more in [Extending pure reflection with `modify`](#extending-pure-reflection-with-modify) and the [modify reflection guide](./docs/modify-reflection.md).
 
 > [!NOTE]
 >
@@ -46,6 +58,7 @@ See this README, the [Glaze Documentation Page](https://stephenberry.github.io/g
 - Extremely portable, uses carefully optimized SWAR (SIMD Within A Register) for broad compatibility
 - [Partial Read](./docs/partial-read.md) and [Partial Write](./docs/partial-write.md) support
 - [CSV Reading/Writing](./docs/csv.md)
+- [TOML Reading/Writing](./docs/toml.md)
 - [Much more!](#more-features)
 
 ## Performance
@@ -185,7 +198,7 @@ auto ec = glz::write_file_json(obj, "./obj.json", std::string{});
 - Tested for both 64bit and 32bit
 - Only supports little-endian systems
 
-[Actions](https://github.com/stephenberry/glaze/actions) build and test with [Clang](https://clang.llvm.org) (17+), [MSVC](https://visualstudio.microsoft.com/vs/features/cplusplus/) (2022), and [GCC](https://gcc.gnu.org) (12+) on apple, windows, and linux.
+[Actions](https://github.com/stephenberry/glaze/actions) build and test with [Clang](https://clang.llvm.org) (18+), [MSVC](https://visualstudio.microsoft.com/vs/features/cplusplus/) (2022), and [GCC](https://gcc.gnu.org) (13+) on apple, windows, and linux.
 
 ![clang build](https://github.com/stephenberry/glaze/actions/workflows/clang.yml/badge.svg) ![gcc build](https://github.com/stephenberry/glaze/actions/workflows/gcc.yml/badge.svg) ![msvc build](https://github.com/stephenberry/glaze/actions/workflows/msvc.yml/badge.svg) 
 
@@ -321,6 +334,57 @@ struct glz::meta<my_struct> {
 > - static constexpr member variables
 > - [Wrappers](./docs/wrappers.md)
 > - Lambda functions
+
+### Extending pure reflection with `modify`
+
+If you only need to tweak a couple of fields, you can layer those changes on top of the automatically reflected members with `glz::meta<T>::modify`:
+
+```c++
+struct server_status
+{
+   std::string name;
+   std::string region;
+   uint64_t active_sessions{};
+   std::optional<std::string> maintenance;
+   double cpu_percent{};
+};
+
+template <> struct glz::meta<server_status>
+{
+   static constexpr auto modify = glz::object(
+      "maintenance_alias", [](auto& self) -> auto& { return self.maintenance; },
+      "cpuPercent", &server_status::cpu_percent
+   );
+};
+```
+
+Serialising
+
+```c++
+server_status status{
+   .name = "edge-01",
+   .region = "us-east",
+   .active_sessions = 2412,
+   .maintenance = std::string{"scheduled"},
+   .cpu_percent = 73.5,
+};
+```
+
+produces
+
+```json
+{
+  "name": "edge-01",
+  "region": "us-east",
+  "active_sessions": 2412,
+  "maintenance": "scheduled",
+  "cpu_percent": 73.5,
+  "maintenance_alias": "scheduled",
+  "cpuPercent": 73.5
+}
+```
+
+All the untouched members (`name`, `region`, `active_sessions`, `maintenance`, `cpu_percent`) still come from pure reflection, so adding or removing members later keeps working automatically. Only the extra keys provided in `modify` are layered on top.
 
 # Reflection API
 
@@ -861,7 +925,7 @@ expect(not glz::write_json(obj, s));
 expect(s == R"({"pi":3.14,"happy":true,"name":"Stephen","arr":["Hello","World",2]})");
 ```
 
-> This approach is significantly faster than `glz::json_t` for generic JSON. But, may not be suitable for all contexts.
+> This approach is significantly faster than `glz::generic` for generic JSON. But, may not be suitable for all contexts.
 
 ## Merge
 
@@ -880,10 +944,10 @@ glz::write_json(merged, s); // will write out a single, merged object
 
 ## Generic JSON
 
-See [Generic JSON](./docs/generic-json.md) for `glz::json_t`.
+See [Generic JSON](./docs/generic-json.md) for `glz::generic`.
 
 ```c++
-glz::json_t json{};
+glz::generic json{};
 std::string buffer = R"([5,"Hello World",{"pi":3.14}])";
 glz::read_json(json, buffer);
 assert(json[2]["pi"].get<double>() == 3.14);

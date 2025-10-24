@@ -48,6 +48,8 @@ Thumbs.db
 
 # Allow mock test data
 !tests/mock_json_test/json/*.json
+alabastar.beve
+*.jsonc
 
 # exclude project files
 **.sln

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace glz
 {
    /**
@@ -13,9 +15,9 @@ namespace glz
     */
    struct version_t
    {
-      uint8_t major = 5;
-      uint8_t minor = 5;
-      uint8_t patch = 2;
+      uint8_t major = 6;
+      uint8_t minor = 0;
+      uint8_t patch = 1;
 
       constexpr auto operator<=>(const version_t& other) const noexcept = default;
 
