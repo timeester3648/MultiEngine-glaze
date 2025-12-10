@@ -11,13 +11,6 @@ Glaze also supports:
 
 > [!IMPORTANT]
 >
-> ## Breaking v6.0.0 changes
->
-> - `glz::json_t` has been renamed to `glz::generic` and will be deprecated in v6.0.0. Update your code to include `glaze/json/generic.hpp` and prefer `glz::generic` to stay aligned with the upcoming release.
-> - Removed `v5.6.0` Glaze C FFI interop. This was a significant experiment that looked like would take off and be extremely useful, but after attempting to use it in production it became clear that the developers wouldn't use this feature and instead create a low-level C API. Someone could create a third party library with the code, but it has been removed from Glaze to focus on more critical features.
-
-> [!IMPORTANT]
->
 > Pure reflection now supports partial modifications through `glz::meta<T>::modify` so you can alias or wrap just a few members without giving up automatic metadata. Learn more in [Extending pure reflection with `modify`](#extending-pure-reflection-with-modify) and the [modify reflection guide](./docs/modify-reflection.md).
 
 > [!NOTE]
@@ -1006,8 +999,6 @@ struct opts
                                       // skip_null_members = false to require nullable members
   bool error_on_const_read =
      false; // Error if attempt is made to read into a const value, by default the value is skipped without error
-
-  bool bools_as_numbers = false; // Read and write booleans with 1's and 0's
 
   bool quoted_num = false; // treat numbers as quoted or array-like types as having quoted numbers
   bool number = false; // treats all types like std::string as numbers: read/write these quoted numbers

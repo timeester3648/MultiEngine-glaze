@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <random>
 #include <ranges>
 #include <set>
+#include <span>
 #if defined(__STDCPP_FLOAT128_T__)
 #include <stdfloat>
 #endif
@@ -6728,11 +6730,16 @@ suite write_as_json_raw = [] {
    };
 };
 
+struct error_on_const_read_opts : glz::opts
+{
+   bool error_on_const_read = true;
+};
+
 suite const_read_error = [] {
    "const_read_error"_test = [] {
       const std::string hello = "world";
       std::string s = R"(explode)";
-      constexpr glz::opts opts{.error_on_const_read = true};
+      constexpr error_on_const_read_opts opts{};
       expect(glz::read<opts>(hello, s) == glz::error_code::attempt_const_read);
    };
 };
@@ -9668,6 +9675,11 @@ struct bools_as_numbers_struct
 };
 
 suite bools_as_numbers_test = [] {
+   struct bools_as_numbers_opts : glz::opts
+   {
+      bool bools_as_numbers = true;
+   };
+
    "bools_as_numbers"_test = [] {
       std::string s = R"({"a":1,"b":0,"c":true,"d":false})";
       bools_as_numbers_struct obj{};
@@ -9680,7 +9692,7 @@ suite bools_as_numbers_test = [] {
    "bools_as_numbers_array"_test = [] {
       std::string s = R"([1,0,1,0])";
       std::array<bool, 4> obj{};
-      constexpr glz::opts opts{.bools_as_numbers = true};
+      constexpr bools_as_numbers_opts opts{};
       expect(!glz::read<opts>(obj, s));
       expect(glz::write<opts>(obj) == s);
    };
@@ -9688,7 +9700,7 @@ suite bools_as_numbers_test = [] {
    "bools_as_numbers_vector"_test = [] {
       std::string s = R"([1,0,1,0])";
       std::vector<bool> obj{};
-      constexpr glz::opts opts{.bools_as_numbers = true};
+      constexpr bools_as_numbers_opts opts{};
       expect(!glz::read<opts>(obj, s));
       expect(glz::write<opts>(obj) == s);
    };
@@ -10207,10 +10219,23 @@ suite array_char_tests = [] {
       std::array<char, 8> value{};
       expect(not glz::read_json(value, R"("hello")"));
       expect(std::string_view{value.data()} == "hello");
-      expect(glz::write_json(value).value_or("error") == R"("hello")");
+      // After fix for issue #1760: std::array<char, N> now respects array bounds
+      // instead of scanning for null terminator (which could cause buffer overflow).
+      // The output includes all 8 characters of the array.
+      // Use const char* for null-terminated C-style string semantics.
+      auto result = glz::write_json(value);
+      expect(result.has_value());
+      expect(result->size() > 7) << "Output should include full array contents";
+      expect(result->front() == '"' && result->back() == '"');
       expect(glz::read_json(value, R"("hello---too long")"));
       expect(not glz::read_json(value, R"("bye")"));
       expect(std::string_view{value.data()} == "bye");
+   };
+
+   "const char* for null-terminated strings"_test = [] {
+      // const char* retains null-terminated semantics for C API compatibility
+      const char* cstr = "hello";
+      expect(glz::write_json(cstr).value_or("error") == R"("hello")");
    };
 };
 
@@ -10507,7 +10532,7 @@ suite const_pointer_tests = [] {
       std::string buffer = R"({"name":"Foo Bar","p_add":{"street":"Baz Yaz"}})";
       trr::Address add{};
       trr::Person p{&add};
-      auto ec = glz::read<glz::opts{.format = glz::JSON, .error_on_const_read = true}>(p, buffer);
+      auto ec = glz::read<error_on_const_read_opts{}>(p, buffer);
       if (ec) {
          std::cout << glz::format_error(ec, buffer) << std::endl;
       }
@@ -10611,10 +10636,15 @@ struct glz::meta<append_obj>
    static constexpr auto value = object("names", append_arrays<&T::names>, "arrays", append_arrays<&T::arrays>);
 };
 
+struct append_arrays_opts : glz::opts
+{
+   bool append_arrays = true;
+};
+
 suite append_arrays_tests = [] {
    "append_arrays vector"_test = [] {
       std::vector<int> v{};
-      constexpr glz::opts append_opts{.append_arrays = true};
+      constexpr append_arrays_opts append_opts{};
       expect(not glz::read<append_opts>(v, "[1,2,3]"));
       expect(v == std::vector<int>{1, 2, 3});
       expect(not glz::read<append_opts>(v, "[4,5,6]"));
@@ -10623,7 +10653,7 @@ suite append_arrays_tests = [] {
 
    "append_arrays deque"_test = [] {
       std::deque<int> v{};
-      constexpr glz::opts append_opts{.append_arrays = true};
+      constexpr append_arrays_opts append_opts{};
       expect(not glz::read<append_opts>(v, "[1,2,3]"));
       expect(v == std::deque<int>{1, 2, 3});
       expect(not glz::read<append_opts>(v, "[4,5,6]"));
@@ -11000,6 +11030,84 @@ suite explicit_string_view_support = [] {
    };
 };
 
+suite span_char_serialization = [] {
+   "write json from std::span<const char>"_test = [] {
+      const char data[] = "hello span";
+      std::span<const char> span{data, 10};
+
+      std::string buffer{};
+      expect(not glz::write_json(span, buffer));
+      expect(buffer == R"("hello span")");
+   };
+
+   "write json from std::span<char>"_test = [] {
+      char data[] = "mutable";
+      std::span<char> span{data, 7};
+
+      std::string buffer{};
+      expect(not glz::write_json(span, buffer));
+      expect(buffer == R"("mutable")");
+   };
+
+   "write json from empty std::span<const char>"_test = [] {
+      std::span<const char> span{};
+
+      std::string buffer{};
+      expect(not glz::write_json(span, buffer));
+      expect(buffer == R"("")");
+   };
+
+   "write json from std::span<const char> with raw_string option"_test = [] {
+      const char data[] = "raw span";
+      std::span<const char> span{data, 8};
+
+      std::string buffer{};
+      expect(not glz::write<glz::opts{.raw_string = true}>(span, buffer));
+      expect(buffer == R"("raw span")");
+   };
+
+   "write json from std::array<char, N> without null terminator"_test = [] {
+      // This tests the fix for issue #1760 buffer overflow
+      // Array has no null terminator - must respect array bounds
+      std::array<char, 5> arr = {'h', 'e', 'l', 'l', 'o'};
+
+      std::string buffer{};
+      expect(not glz::write_json(arr, buffer));
+      expect(buffer == R"("hello")") << buffer;
+   };
+
+   "write json from std::array<char, N> with null terminator"_test = [] {
+      // Array contains null terminator as part of the data
+      // The full array size should be used, including the null
+      std::array<char, 6> arr = {'h', 'e', 'l', 'l', 'o', '\0'};
+
+      std::string buffer{};
+      expect(not glz::write_json(arr, buffer));
+      // The null character is included in the output (escaped as \u0000 or similar)
+      expect(buffer.size() > 2) << "Buffer should contain data";
+      expect(buffer.front() == '"' && buffer.back() == '"') << "Should be quoted string";
+   };
+
+   "write json from std::array<char, N> with embedded null"_test = [] {
+      // Array with embedded null - should serialize full array
+      std::array<char, 5> arr = {'a', '\0', 'b', 'c', 'd'};
+
+      std::string buffer{};
+      expect(not glz::write_json(arr, buffer));
+      // Should contain all 5 characters, with embedded null escaped
+      expect(buffer.size() > 2) << buffer;
+   };
+
+   "const char* uses null-terminated semantics"_test = [] {
+      // const char* should still use null-terminated semantics for C API compatibility
+      const char* cstr = "c-string";
+
+      std::string buffer{};
+      expect(not glz::write_json(cstr, buffer));
+      expect(buffer == R"("c-string")") << buffer;
+   };
+};
+
 suite member_function_pointer_serialization = [] {
    "member function pointer skipped in json write"_test = [] {
       MemberFunctionThing thing{};
@@ -11061,6 +11169,121 @@ suite member_function_pointer_serialization = [] {
       std::string buffer2{};
       expect(not glz::write<opts_with_member_functions{}>(s, buffer2));
       expect(buffer2 == R"({"f1":"unsigned char (struct_t::*)() const noexcept"})") << buffer2;
+   };
+};
+
+// Test struct for requires_key customization point during parsing
+// Demonstrates making non-nullable fields optional without using std::optional
+struct requires_key_parsing_test
+{
+   int required_field1{};
+   int optional_field{}; // Non-nullable but made optional via requires_key
+   int required_field2{};
+   int reserved_internal{}; // Internal field that shouldn't be required
+};
+
+template <>
+struct glz::meta<requires_key_parsing_test>
+{
+   static constexpr bool requires_key(const std::string_view key, const bool is_nullable)
+   {
+      // Make optional_field not required, even though it's not a nullable type
+      if (key == "optional_field") {
+         return false;
+      }
+      // Make reserved_internal not required
+      if (key == "reserved_internal") {
+         return false;
+      }
+      // All other non-nullable fields are required
+      return !is_nullable;
+   }
+};
+
+// Test struct for mixing nullable types with requires_key
+struct mixed_nullable_and_requires_key_test
+{
+   int required{};
+   std::optional<int> optional_by_type{};
+   int optional_by_key{};
+};
+
+template <>
+struct glz::meta<mixed_nullable_and_requires_key_test>
+{
+   static constexpr bool requires_key(std::string_view key, bool is_nullable)
+   {
+      if (key == "optional_by_key") {
+         return false;
+      }
+      return !is_nullable;
+   }
+};
+
+suite requires_key_parsing_tests = [] {
+   using namespace ut;
+
+   "requires_key allows non-nullable fields to be optional during parsing"_test = [] {
+      // Test 1: All required fields present, optional fields missing
+      {
+         std::string json = R"({"required_field1":1,"required_field2":2})";
+         requires_key_parsing_test obj{};
+         constexpr auto opts = glz::opts{.error_on_missing_keys = true};
+
+         auto ec = glz::read<opts>(obj, json);
+         expect(not ec) << glz::format_error(ec, json);
+         expect(obj.required_field1 == 1);
+         expect(obj.required_field2 == 2);
+         expect(obj.optional_field == 0); // Default value
+         expect(obj.reserved_internal == 0); // Default value
+      }
+
+      // Test 2: Missing a required field should fail
+      {
+         std::string json = R"({"required_field1":1,"optional_field":99})";
+         requires_key_parsing_test obj{};
+         constexpr auto opts = glz::opts{.error_on_missing_keys = true};
+
+         auto ec = glz::read<opts>(obj, json);
+         expect(ec == glz::error_code::missing_key) << glz::format_error(ec, json);
+      }
+
+      // Test 3: All fields present including optional
+      {
+         std::string json = R"({"required_field1":1,"optional_field":99,"required_field2":2,"reserved_internal":77})";
+         requires_key_parsing_test obj{};
+         constexpr auto opts = glz::opts{.error_on_missing_keys = true};
+
+         auto ec = glz::read<opts>(obj, json);
+         expect(not ec) << glz::format_error(ec, json);
+         expect(obj.required_field1 == 1);
+         expect(obj.optional_field == 99);
+         expect(obj.required_field2 == 2);
+         expect(obj.reserved_internal == 77);
+      }
+
+      // Test 4: Only optional fields present should fail
+      {
+         std::string json = R"({"optional_field":99,"reserved_internal":77})";
+         requires_key_parsing_test obj{};
+         constexpr auto opts = glz::opts{.error_on_missing_keys = true};
+
+         auto ec = glz::read<opts>(obj, json);
+         expect(ec == glz::error_code::missing_key);
+      }
+   };
+
+   "requires_key works with nullable types"_test = [] {
+      // All three fields can be missing except 'required'
+      std::string json = R"({"required":42})";
+      mixed_nullable_and_requires_key_test obj{};
+      constexpr auto opts = glz::opts{.error_on_missing_keys = true};
+
+      auto ec = glz::read<opts>(obj, json);
+      expect(not ec) << glz::format_error(ec, json);
+      expect(obj.required == 42);
+      expect(not obj.optional_by_type.has_value());
+      expect(obj.optional_by_key == 0);
    };
 };
 

@@ -65,7 +65,7 @@ namespace glz
             }
          }
 
-         if constexpr (Opts.bools_as_numbers) {
+         if constexpr (check_bools_as_numbers(Opts)) {
             if (value) {
                std::memcpy(&b[ix], "1", 1);
             }
@@ -180,7 +180,7 @@ namespace glz
                      return value ? value : "";
                   }
                   else if constexpr (array_char_t<T>) {
-                     return *value.data() ? sv{value.data()} : "";
+                     return sv{value.data(), value.size()};
                   }
                   else {
                      return sv{value};

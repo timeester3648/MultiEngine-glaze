@@ -319,7 +319,26 @@ namespace glz
       if constexpr (Opts.error_on_missing_keys) {
          for_each<N>([&]<auto I>() constexpr {
             using V = std::decay_t<refl_t<T, I>>;
-            if constexpr (is_specialization_v<V, custom_t>) {
+
+            // Check if meta<T>::requires_key customization point exists
+            if constexpr (meta_has_requires_key<T>) {
+               constexpr auto key = reflect<T>::keys[I];
+               constexpr bool is_nullable = [] {
+                  if constexpr (is_specialization_v<V, custom_t>) {
+                     using From = typename V::from_t;
+                     return custom_type_is_nullable<V, From>();
+                  }
+                  else if constexpr (is_cast<V>) {
+                     using CastType = typename V::cast_type;
+                     return null_t<CastType>;
+                  }
+                  else {
+                     return null_t<V>;
+                  }
+               }();
+               fields[I] = meta<T>::requires_key(key, is_nullable);
+            }
+            else if constexpr (is_specialization_v<V, custom_t>) {
                using From = typename V::from_t;
 
                // If we are reading a glz::custom_t, we must deduce the input argument and not require the key if it is
@@ -482,8 +501,15 @@ namespace glz
    {
       using V = std::decay_t<T>;
       using U = std::underlying_type_t<V>;
-      constexpr auto arr = make_enum_to_string_array<V>();
-      return arr[static_cast<U>(enum_value)];
+
+      // use make_enum_to_string_map for O(1) lookup with perfect hashing
+      // This handles non-monotonic enums and large values safely
+      constexpr auto map = make_enum_to_string_map<V>();
+      const auto it = map.find(static_cast<U>(enum_value));
+      if (it != map.end()) {
+         return it->second;
+      }
+      return std::string_view{};
    }
 
    template <glaze_flags_t T>

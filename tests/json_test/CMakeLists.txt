@@ -69,3 +69,27 @@ add_executable(nullable_lambda_test nullable_lambda_test.cpp)
 target_link_libraries(nullable_lambda_test PRIVATE glz_test_common)
 
 add_test(NAME nullable_lambda_test COMMAND nullable_lambda_test)
+
+## Byte array test - test for issue #1959 and PR #1966
+
+add_executable(byte_array_test byte_array_test.cpp)
+
+target_link_libraries(byte_array_test PRIVATE glz_test_common)
+
+add_test(NAME byte_array_test COMMAND byte_array_test)
+
+## Indexed rename_key test - generic solution for issue #1117
+
+add_executable(indexed_rename_key_test indexed_rename_key_test.cpp)
+
+target_link_libraries(indexed_rename_key_test PRIVATE glz_test_common)
+
+add_test(NAME indexed_rename_key_test COMMAND indexed_rename_key_test)
+
+## Skip null on read test - test for issue #1047
+
+add_executable(skip_null_on_read_test skip_null_on_read_test.cpp)
+
+target_link_libraries(skip_null_on_read_test PRIVATE glz_test_common)
+
+add_test(NAME skip_null_on_read_test COMMAND skip_null_on_read_test)

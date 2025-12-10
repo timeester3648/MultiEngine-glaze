@@ -15,6 +15,7 @@
 #include <glaze/glaze.hpp>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <source_location>
 #include <thread>
@@ -406,12 +407,64 @@ namespace glz
 #endif
                                              asio::ip::tcp::socket>;
 
-      inline http_server() : io_context(std::make_unique<asio::io_context>())
+      /**
+       * @brief Construct an HTTP server
+       *
+       * @param context Optional external io_context to use. If nullptr, creates its own.
+       *                Using an external io_context allows sharing the event loop with
+       *                other asio-based components or managing the io_context lifecycle
+       *                externally.
+       * @param custom_error_handler Optional error handler for server errors.
+       *                             If not provided, uses a default handler that prints
+       *                             to stderr.
+       *
+       * Example with internal io_context (default):
+       * @code
+       * glz::http_server server;
+       * server.bind(8080);
+       * server.start();  // Creates worker threads using hardware_concurrency()
+       * @endcode
+       *
+       * Example with external io_context:
+       * @code
+       * auto io_ctx = std::make_shared<asio::io_context>();
+       * glz::http_server server(io_ctx);
+       * server.bind(8080);
+       * server.start(0);  // Pass 0 to skip creating worker threads
+       *
+       * // Run io_context in your own thread(s)
+       * std::thread io_thread([io_ctx]() {
+       *    io_ctx->run();
+       * });
+       *
+       * // ... later ...
+       * server.stop();
+       * io_ctx->stop();
+       * io_thread.join();
+       * @endcode
+       *
+       * Example with custom error handler:
+       * @code
+       * auto error_handler = [](std::error_code ec, std::source_location loc) {
+       *    my_logger.error("Server error at {}:{}: {}",
+       *                    loc.file_name(), loc.line(), ec.message());
+       * };
+       * glz::http_server server(nullptr, error_handler);
+       * @endcode
+       */
+      inline http_server(std::shared_ptr<asio::io_context> context = nullptr,
+                         glz::error_handler custom_error_handler = {})
+         : io_context(context ? context : std::make_shared<asio::io_context>())
       {
-         error_handler = [](std::error_code ec, std::source_location loc) {
-            std::fprintf(stderr, "Error at %s:%d: %s\n", loc.file_name(), static_cast<int>(loc.line()),
-                         ec.message().c_str());
-         };
+         if (custom_error_handler) {
+            error_handler = std::move(custom_error_handler);
+         }
+         else {
+            error_handler = [](std::error_code ec, std::source_location loc) {
+               std::fprintf(stderr, "Error at %s:%d: %s\n", loc.file_name(), static_cast<int>(loc.line()),
+                            ec.message().c_str());
+            };
+         }
 
          // Initialize SSL context for TLS-enabled servers
          if constexpr (EnableTLS) {
@@ -436,6 +489,10 @@ namespace glz
             }
          }
          threads.clear();
+
+         // websocket_handlers_ destruction will call close_all_connections() on each
+         // websocket_server, which force-closes all sockets. This ensures sockets are
+         // deregistered from the reactor BEFORE io_context is destroyed.
       }
 
       inline http_server& bind(std::string_view address, uint16_t port)
@@ -452,7 +509,72 @@ namespace glz
 
       inline http_server& bind(uint16_t port) { return bind("0.0.0.0", port); }
 
-      inline void start(size_t num_threads = 0)
+      inline uint16_t port(asio::error_code& ec) const
+      {
+         if (!acceptor) {
+            ec = asio::error::not_connected;
+            return 0;
+         }
+         auto endpoint = acceptor->local_endpoint(ec);
+         if (ec) {
+            return 0;
+         }
+         return endpoint.port();
+      }
+
+      inline uint16_t port() const
+      {
+         if (!acceptor) {
+            throw std::runtime_error("Server not bound");
+         }
+         return acceptor->local_endpoint().port();
+      }
+
+      /**
+       * @brief Start the HTTP server
+       *
+       * @param num_threads Number of worker threads to create:
+       *                    - std::nullopt (default): Uses std::thread::hardware_concurrency(),
+       *                      with a minimum of 1 thread if hardware_concurrency() returns 0
+       *                    - 0: No worker threads created (caller manages io_context::run())
+       *                    - N: Creates exactly N worker threads
+       *
+       * When using an external io_context, pass 0 to avoid creating threads,
+       * then call io_context::run() in your own thread(s).
+       *
+       * Example with default behavior:
+       * @code
+       * glz::http_server server;
+       * server.bind(8080);
+       * server.start();  // Uses hardware_concurrency() threads
+       * @endcode
+       *
+       * Example with specific thread count:
+       * @code
+       * glz::http_server server;
+       * server.bind(8080);
+       * server.start(4);  // Creates exactly 4 worker threads
+       * @endcode
+       *
+       * Example with external io_context:
+       * @code
+       * auto io_ctx = std::make_shared<asio::io_context>();
+       * glz::http_server server(io_ctx);
+       * server.bind(8080);
+       * server.start(0);  // No worker threads - caller manages io_context
+       *
+       * // Run io_context in your own thread
+       * std::thread io_thread([io_ctx]() {
+       *    io_ctx->run();
+       * });
+       *
+       * // ... later ...
+       * server.stop();
+       * io_ctx->stop();
+       * io_thread.join();
+       * @endcode
+       */
+      inline void start(std::optional<size_t> num_threads = std::nullopt)
       {
          if (running || !acceptor) {
             return;
@@ -460,21 +582,32 @@ namespace glz
 
          running = true;
 
-         // Use hardware concurrency if not specified
-         if (num_threads == 0) {
-            num_threads = std::thread::hardware_concurrency();
+         // Determine number of threads
+         size_t actual_threads;
+         if (num_threads.has_value()) {
+            // Use the explicitly specified value (including 0)
+            actual_threads = *num_threads;
+         }
+         else {
+            // Use hardware concurrency, but ensure at least 1 thread
+            actual_threads = std::thread::hardware_concurrency();
+            if (actual_threads == 0) {
+               actual_threads = 1;
+            }
          }
 
          // Start the acceptor
          do_accept();
 
-         // Start worker threads
-         threads.reserve(num_threads);
-         for (size_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back([this] {
-               io_context->run();
-               // Don't report errors during shutdown
-            });
+         // Start worker threads (unless explicitly set to 0)
+         if (actual_threads > 0) {
+            threads.reserve(actual_threads);
+            for (size_t i = 0; i < actual_threads; ++i) {
+               threads.emplace_back([this] {
+                  io_context->run();
+                  // Don't report errors during shutdown
+               });
+            }
          }
       }
 
@@ -1010,7 +1143,7 @@ namespace glz
       }
 
      private:
-      std::unique_ptr<asio::io_context> io_context;
+      std::shared_ptr<asio::io_context> io_context;
       std::unique_ptr<asio::ip::tcp::acceptor> acceptor;
       std::vector<std::thread> threads;
       http_router root_router;
@@ -1101,11 +1234,15 @@ namespace glz
 
                // Parse request line
                size_t request_line_end_pos = headers_part.find("\r\n");
+               std::string_view request_line;
                if (request_line_end_pos == std::string_view::npos) {
-                  request_line_end_pos = headers_part.length();
+                  request_line = headers_part; // Request line is the entire headers_part
+                  headers_part = ""; // headers_part becomes empty as there are no more headers
                }
-               std::string_view request_line = headers_part.substr(0, request_line_end_pos);
-               headers_part.remove_prefix(request_line_end_pos + 2); // +2 for \r\n
+               else {
+                  request_line = headers_part.substr(0, request_line_end_pos);
+                  headers_part.remove_prefix(request_line_end_pos + 2); // +2 for \r\n
+               }
 
                // Parse method, target, and HTTP version from the request line
                size_t first_space = request_line.find(' ');
@@ -1269,7 +1406,7 @@ namespace glz
 
          // Create WebSocket connection and start it
          // Need to include websocket_connection.hpp for this to work
-         auto ws_conn = std::make_shared<websocket_connection>(std::move(*socket), ws_it->second.get());
+         auto ws_conn = std::make_shared<websocket_connection<asio::ip::tcp::socket>>(socket, ws_it->second);
          ws_conn->start(req);
       }
 
